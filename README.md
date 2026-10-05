@@ -22,6 +22,7 @@ Draw(frame, dets);                                    // boxes + labels
 - [API](#api)
 - [Repository layout](#repository-layout)
 - [Requirements](#requirements)
+- [Property sheets (.props)](#property-sheets-props)
 - [Building the DLL](#building-the-dll)
 - [Using the DLL in another project](#using-the-dll-in-another-project)
 - [Class names](#class-names)
@@ -69,6 +70,7 @@ Behaviour to know:
 
 ```
 SDKsourceCode.sln                 Visual Studio 2022 solution
+UseTritonVision.props             property sheet for projects that USE the DLL
 SDKsourceCode/
 ├─ SDKsourceCode.vcxproj          DLL project (output: TritonVision.dll)
 ├─ TritonVision.Build.props       include paths, defines, libraries, dependency locations
@@ -112,6 +114,32 @@ The dependencies are **not** part of this repository.
 - The **OpenCV folder** is the package's `build` folder: it contains `include\opencv2\` and `x64\vc16\lib\opencv_world500.lib`.
 
 If a folder is not found, the build stops with a message naming the path it tried.
+
+## Property sheets (.props)
+
+A `.props` file (MSBuild property sheet) holds Visual Studio project settings: include
+directories, library directories, the list of `.lib` files to link, defines, runtime library.
+A project imports it once instead of setting each of these by hand in **Project → Properties**,
+for every configuration. When a setting changes, only the `.props` file is edited.
+
+This repository has two:
+
+| File | Used by | What it sets |
+| --- | --- | --- |
+| [`SDKsourceCode/TritonVision.Build.props`](SDKsourceCode/TritonVision.Build.props) | The DLL project itself (already imported by `SDKsourceCode.vcxproj`) | gRPC and OpenCV locations, include paths, `TRITONVISION_EXPORTS`, `/MD`, C++17, and the ~110 gRPC / Protobuf / Abseil libraries |
+| [`UseTritonVision.props`](UseTritonVision.props) | Projects that **use** the DLL | `TritonVision.h` and OpenCV include paths, `TritonVision.lib` + `opencv_world500.lib`, `/MD`, `_DEBUG` undefined, C++17, and copying the DLLs next to the `.exe` |
+
+A property sheet is imported in one of two ways:
+
+- **Visual Studio:** **View → Other Windows → Property Manager**, right-click a configuration
+  (e.g. **Debug | x64**) → **Add Existing Property Sheet…** → select the `.props` file.
+- **Project file:** one line in the `.vcxproj`, inside the `PropertySheets` import group:
+  ```xml
+  <Import Project="..\TritonVisionSDK\UseTritonVision.props" />
+  ```
+
+Settings in a `.props` file use `%(…)` (for example `%(AdditionalDependencies)`), so they are added
+to the project's own settings instead of replacing them.
 
 ## Building the DLL
 
@@ -158,6 +186,19 @@ The DLL depends on `opencv_world500.dll` and the Visual C++ runtime (`MSVCP140.d
 The calling project needs `TritonVision.h`, the OpenCV headers, `TritonVision.lib` and
 `opencv_world500.lib`, and must use the same C++ runtime as the DLL, because
 `std::string`, `std::vector` and `cv::Mat` cross the DLL boundary.
+
+### Option A: `UseTritonVision.props` (recommended)
+
+1. Build this repository's `SDKsourceCode.sln` in **Release | x64** (produces `bin/x64/Release/TritonVision.lib` and `.dll`).
+2. In your project, add [`UseTritonVision.props`](UseTritonVision.props) to **Debug | x64** and **Release | x64**
+   ([how](#property-sheets-props)).
+3. Set the platform to **x64**, `#include "TritonVision.h"`, and build.
+
+`TritonVision.dll` and `opencv_world500.dll` are copied next to your `.exe` after each build.
+The build stops with a clear message if the platform is not x64, the DLL has not been built yet,
+or OpenCV is not found. In Debug, warning D9025 (`overriding '/D_DEBUG' with '/U_DEBUG'`) is expected.
+
+### Option B: manual settings
 
 | Project property (x64, all configurations) | Value |
 | --- | --- |
@@ -252,6 +293,8 @@ From the `SDKsourceCode` project folder, with `GRPC` set to the gRPC install fol
 | `LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL'` | `/MDd` or `_DEBUG` in this or the calling project | Use `/MD` and undefine `_DEBUG` |
 | `LNK1112` / missing libraries | Platform is Win32 | Build x64 |
 | `LNK1104: cannot open file 'TritonVision.dll'` | The DLL is in use by a running program | Close the program or debugger, then rebuild |
+| `TritonVision.lib not found in '...'` (from `UseTritonVision.props`) | The DLL has not been built | Build `SDKsourceCode.sln` in Release \| x64 |
+| `warning D9025: overriding '/D_DEBUG' with '/U_DEBUG'` | `UseTritonVision.props` undefines `_DEBUG` on purpose | Expected; ignore |
 | Crash or garbled strings in `Detect` / `LastError` in the calling app | The app uses the debug runtime | Same runtime as the DLL: `/MD`, no `_DEBUG` |
 | `Connect` fails: `failed to connect to all addresses` / `UNAVAILABLE` | Wrong IP, HTTP port 8000 instead of gRPC 8001, server down, firewall | Check the address and that the server is reachable |
 | `Connect` fails with a model error | Model name wrong or model not READY | Use the exact name from the Triton model repository |

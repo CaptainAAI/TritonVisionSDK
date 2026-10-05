@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Property sheet for projects that USE TritonVision.dll.
+
+  Add it to a project once instead of setting include paths and libraries by hand:
+    View -> Other Windows -> Property Manager -> right-click "Debug | x64" and "Release | x64"
+    -> Add Existing Property Sheet -> UseTritonVision.props
+  or add this line to the project's PropertySheets import group:
+    <Import Project="<path>\UseTritonVision.props" />
+
+  It sets:
+    - include paths: TritonVision.h and the OpenCV headers
+    - libraries:     TritonVision.lib and opencv_world500.lib
+    - runtime:       /MD, _DEBUG undefined, C++17 (must match the DLL)
+    - after build:   copies TritonVision.dll and opencv_world500.dll next to the .exe
+
+  Build TritonVision (Release | x64) in this repository first.
+  OpenCV is found the same way as in SDKsourceCode\TritonVision.Build.props:
+  /p:OpenCVRoot=..., then TRITONVISION_OPENCV_ROOT, then ..\..\library\opencv\build\.
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <TvRepo>$(MSBuildThisFileDirectory)</TvRepo>
+    <TvBin>$(TvRepo)bin\x64\Release\</TvBin>
+
+    <TvOpenCVRoot Condition="'$(OpenCVRoot)' != ''">$(OpenCVRoot)</TvOpenCVRoot>
+    <TvOpenCVRoot Condition="'$(TvOpenCVRoot)' == '' and '$(TRITONVISION_OPENCV_ROOT)' != ''">$(TRITONVISION_OPENCV_ROOT)</TvOpenCVRoot>
+    <TvOpenCVRoot Condition="'$(TvOpenCVRoot)' == ''">$(TvRepo)..\..\library\opencv\build\</TvOpenCVRoot>
+    <TvOpenCVRoot>$([MSBuild]::EnsureTrailingSlash('$(TvOpenCVRoot)'))</TvOpenCVRoot>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- OpenCV headers are "external": their warnings are not shown -->
+    <ExternalIncludePath>$(TvOpenCVRoot)include;$(ExternalIncludePath)</ExternalIncludePath>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(TvRepo)SDKsourceCode\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <!-- std::string / std::vector / cv::Mat cross the DLL boundary: same runtime as the DLL -->
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <UndefinePreprocessorDefinitions>_DEBUG;%(UndefinePreprocessorDefinitions)</UndefinePreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(TvBin);$(TvOpenCVRoot)x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>TritonVision.lib;opencv_world500.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Clear messages instead of compiler/linker errors -->
+  <Target Name="UseTritonVisionCheck" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Platform)' != 'x64'" Text="TritonVision supports x64 only (current platform: $(Platform))." />
+    <Error Condition="!Exists('$(TvBin)TritonVision.lib')"
+           Text="TritonVision.lib not found in '$(TvBin)'. Build SDKsourceCode.sln (Release | x64) first." />
+    <Error Condition="!Exists('$(TvOpenCVRoot)include\opencv2\core.hpp')"
+           Text="OpenCV not found at '$(TvOpenCVRoot)'. Set TRITONVISION_OPENCV_ROOT (or /p:OpenCVRoot=...) to the OpenCV 'build' folder." />
+  </Target>
+
+  <!-- Copy the runtime DLLs next to the application -->
+  <Target Name="UseTritonVisionCopyDlls" AfterTargets="Build">
+    <Copy SourceFiles="$(TvBin)TritonVision.dll;$(TvOpenCVRoot)x64\vc16\bin\opencv_world500.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>
