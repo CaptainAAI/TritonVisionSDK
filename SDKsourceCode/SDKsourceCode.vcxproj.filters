@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="API">
+      <UniqueIdentifier>{6B1E2C4A-3F0D-4C8E-9A51-2D7B8E9F0A11}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="triton">
+      <UniqueIdentifier>{8D3A4E6C-512F-4EA0-BC73-4F9DA0B12C33}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="generated">
+      <UniqueIdentifier>{7C2F3D5B-401E-4D9F-AB62-3E8C9FA01B22}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="proto">
+      <UniqueIdentifier>{9E4B5F7D-6230-4FB1-CD84-50AEB1C23D44}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\TritonVision.h"><Filter>API</Filter></ClInclude>
+    <ClInclude Include="triton\common.h"><Filter>triton</Filter></ClInclude>
+    <ClInclude Include="triton\grpc_client.h"><Filter>triton</Filter></ClInclude>
+    <ClInclude Include="triton\ipc.h"><Filter>triton</Filter></ClInclude>
+    <ClInclude Include="generated\grpc_service.grpc.pb.h"><Filter>generated</Filter></ClInclude>
+    <ClInclude Include="generated\grpc_service.pb.h"><Filter>generated</Filter></ClInclude>
+    <ClInclude Include="generated\health.grpc.pb.h"><Filter>generated</Filter></ClInclude>
+    <ClInclude Include="generated\health.pb.h"><Filter>generated</Filter></ClInclude>
+    <ClInclude Include="generated\model_config.grpc.pb.h"><Filter>generated</Filter></ClInclude>
+    <ClInclude Include="generated\model_config.pb.h"><Filter>generated</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\TritonVision.cpp"><Filter>API</Filter></ClCompile>
+    <ClCompile Include="triton\common.cc"><Filter>triton</Filter></ClCompile>
+    <ClCompile Include="triton\grpc_client.cc"><Filter>triton</Filter></ClCompile>
+    <ClCompile Include="generated\grpc_service.grpc.pb.cc"><Filter>generated</Filter></ClCompile>
+    <ClCompile Include="generated\grpc_service.pb.cc"><Filter>generated</Filter></ClCompile>
+    <ClCompile Include="generated\health.grpc.pb.cc"><Filter>generated</Filter></ClCompile>
+    <ClCompile Include="generated\health.pb.cc"><Filter>generated</Filter></ClCompile>
+    <ClCompile Include="generated\model_config.grpc.pb.cc"><Filter>generated</Filter></ClCompile>
+    <ClCompile Include="generated\model_config.pb.cc"><Filter>generated</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="TritonVision.Build.props" />
+    <None Include="proto\grpc_service.proto"><Filter>proto</Filter></None>
+    <None Include="proto\health.proto"><Filter>proto</Filter></None>
+    <None Include="proto\model_config.proto"><Filter>proto</Filter></None>
+  </ItemGroup>
+</Project>
