@@ -9,8 +9,8 @@ Two ways to detect, usable side by side:
 
 - `Connect` + `Detect`: the image is pre-processed **on the PC** and sent as a float tensor (~4.9 MB at 640×640).
 - `ConnectImage` + `DetectImage`: only the **encoded image** (JPEG/PNG, typically 50–300 KB) is sent;
-  pre-processing runs **on the server's GPU** with NVIDIA DALI (e.g. on the Jetson). Needs the server models in
-  [`server/`](#server-side-pre-processing).
+  pre-processing runs **on the server's GPU** with NVIDIA DALI (e.g. on the Jetson). Needs the server models from
+  [Server-side pre-processing](#server-side-pre-processing).
 
 ```cpp
 #include "TritonVision.h"
@@ -425,7 +425,7 @@ The server files are in [`server/model_repository/`](server/model_repository):
 
 | Model | Files | What it does |
 | --- | --- | --- |
-| `preprocess` | `config.pbtxt`, [`1/dali.py`](server/model_repository/preprocess/1/dali.py) | DALI pipeline: GPU decode, resize keeping the aspect ratio, centre on a 640×640 grey (114) canvas, RGB, 0..1, CHW. Outputs `images` `[3, 640, 640]` and `LETTERBOX`. Batches up to 8 requests. |
+| `preprocess` | `config.pbtxt`, `1/dali.py` ([code](#server-code)) | DALI pipeline: GPU decode, resize keeping the aspect ratio, centre on a 640×640 grey (114) canvas, RGB, 0..1, CHW. Outputs `images` `[3, 640, 640]` and `LETTERBOX`. Batches up to 8 requests. |
 | `model1_image`, `model2_image`, `model3_image` | `config.pbtxt`, empty `1/` | Ensembles `preprocess` → `model1` / `model2` / `model3` |
 
 The letterbox is the same as in `Detect`, so both functions give the same detections.
@@ -460,15 +460,250 @@ send the file bytes, or use `jpegQuality = 100`, when that matters.
 | detection output (any name, here `output0`) | `FP32`, a [supported layout](#supported-model-outputs) | the YOLO model's output, in letterboxed coordinates |
 | `LETTERBOX` | `FP32` `[1, 5]` (or `[5]`) | `scale, pad_x, pad_y, width, height` of the letterbox the server applied |
 
+### Server code
+
+The complete server side is three small files. Model repository layout:
+
+```
+model_repository/
+├─ model1/                 existing YOLO model (TensorRT), unchanged
+├─ preprocess/
+│  ├─ config.pbtxt
+│  └─ 1/dali.py
+└─ model1_image/
+   ├─ config.pbtxt
+   └─ 1/                   empty folder (required)
+```
+
+**`preprocess/1/dali.py`**: the DALI pipeline. Triton's DALI backend serializes it when the model loads.
+
+```python
+# DALI pre-processing for the YOLO models. Triton's DALI backend serializes this
+# pipeline when the model loads (@autoserialize), so there is no model.dali file.
+#
+# Input : ENCODED   - bytes of a JPEG/PNG file, UINT8 [N]
+# Output: images    - letterboxed RGB image, FP32 [3, 640, 640], 0..1, CHW
+#         LETTERBOX - [scale, pad_x, pad_y, width, height], FP32 [5]; the client
+#                     uses it to map boxes back to the original image
+#
+# Same letterbox as TritonVision Detect(): resize keeping the aspect ratio,
+# centre on a 640x640 grey (114) canvas.
+#
+# Note: DALI cannot skip a bad sample. Bytes that are not an image make the
+# pipeline fail and every later request fails too, until the model is reloaded.
+
+import nvidia.dali as dali
+import nvidia.dali.fn as fn
+import nvidia.dali.types as types
+from nvidia.dali.plugin.triton import autoserialize
+
+W, H = 640, 640
+
+
+@autoserialize
+@dali.pipeline_def(batch_size=8, num_threads=4, device_id=0)
+def pipe():
+    encoded = fn.external_source(device="cpu", name="ENCODED", dtype=types.UINT8, ndim=1)
+
+    # Letterbox geometry, computed on the CPU from the image header.
+    shape = fn.cast(fn.peek_image_shape(encoded), dtype=types.FLOAT)    # [h, w, c]
+    h, w = shape[0], shape[1]
+    scale = dali.math.min(W / w, H / h)
+    nw = dali.math.floor(w * scale + 0.5)
+    nh = dali.math.floor(h * scale + 0.5)
+    px = dali.math.floor((W - nw) / 2)
+    py = dali.math.floor((H - nh) / 2)
+
+    # Decode on the GPU. affine=False: thread pinning needs NVML, which cannot
+    # query the Jetson iGPU, and every decode then fails with "nvml error (6)".
+    img = fn.decoders.image(encoded, device="mixed", output_type=types.RGB, affine=False)
+    img = fn.resize(img, resize_x=nw, resize_y=nh, interp_type=types.INTERP_LINEAR, antialias=False)
+    img = fn.slice(img, start=fn.cast(fn.stack(-py, -px), dtype=types.INT32), shape=[H, W],
+                   axis_names="HW", out_of_bounds_policy="pad", fill_values=114)
+    img = fn.crop_mirror_normalize(img, dtype=types.FLOAT, output_layout="CHW",
+                                   mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0])
+
+    letterbox = fn.stack(scale, px, py, w, h)
+    return img, letterbox
+```
+
+How each step matches `Detect` on the PC:
+
+| `dali.py` | `Detect` in `src/TritonVision.cpp` |
+| --- | --- |
+| `peek_image_shape` → `scale`, `nw`, `nh`, `px`, `py` | `scale = min(W/cols, H/rows)`, `std::round`, padding `(W - nw) / 2` |
+| `decoders.image(..., output_type=RGB)` | `cv::cvtColor(BGR2RGB)` |
+| `resize(..., INTERP_LINEAR)` | `cv::resize` (bilinear) |
+| `slice(..., out_of_bounds_policy="pad", fill_values=114)` | grey 114 canvas + `copyTo` |
+| `crop_mirror_normalize(std=255, layout CHW)` | `convertTo(1/255)` + `cv::split` into planes |
+
+**`preprocess/config.pbtxt`**
+
+```protobuf
+name: "preprocess"
+backend: "dali"
+max_batch_size: 8
+
+input [
+  {
+    name: "ENCODED"
+    data_type: TYPE_UINT8
+    dims: [ -1 ]          # bytes of a JPEG/PNG file
+  }
+]
+
+# Same order as the pipeline's return values in 1/dali.py.
+output [
+  {
+    name: "images"
+    data_type: TYPE_FP32
+    dims: [ 3, 640, 640 ]
+  },
+  {
+    name: "LETTERBOX"
+    data_type: TYPE_FP32
+    dims: [ 5 ]           # scale, pad_x, pad_y, width, height
+  }
+]
+
+instance_group [{ kind: KIND_GPU }]
+```
+
+**`model1_image/config.pbtxt`**: the ensemble the client connects to. For `model2_image` / `model3_image`
+only `name`, the comment and the second step's `model_name` change.
+
+```protobuf
+# Encoded image in, detections out: preprocess (DALI) -> model1.
+# Used by TritonVision ConnectImage() / DetectImage().
+name: "model1_image"
+platform: "ensemble"
+max_batch_size: 0         # model1 has no batching; the batch dim of 1 is explicit
+
+input [
+  {
+    name: "IMAGE"
+    data_type: TYPE_UINT8
+    dims: [ 1, -1 ]       # bytes of a JPEG/PNG file
+  }
+]
+
+output [
+  {
+    name: "output0"
+    data_type: TYPE_FP32
+    dims: [ 1, 6, 8400 ]
+  },
+  {
+    name: "LETTERBOX"
+    data_type: TYPE_FP32
+    dims: [ 1, 5 ]        # scale, pad_x, pad_y, width, height
+  }
+]
+
+ensemble_scheduling {
+  step [
+    {
+      model_name: "preprocess"
+      model_version: -1
+      input_map { key: "ENCODED" value: "IMAGE" }
+      output_map { key: "images" value: "preprocessed" }
+      output_map { key: "LETTERBOX" value: "LETTERBOX" }
+    },
+    {
+      model_name: "model1"
+      model_version: -1
+      input_map { key: "images" value: "preprocessed" }
+      output_map { key: "output0" value: "output0" }
+    }
+  ]
+}
+```
+
+The `model1` it chains to (existing, for reference): `max_batch_size: 0`, input `images` FP32
+`[1, 3, 640, 640]`, output `output0` FP32 `[1, 6, 8400]` (4 box values + 2 classes, 8400 candidates).
+
+### Checking the ensemble on the server
+
+Before testing from the PC, send one image directly on the Jetson (needs `pip install tritonclient[grpc]`):
+
+```python
+import numpy as np
+import tritonclient.grpc as g
+
+c = g.InferenceServerClient("localhost:8001")
+data = np.fromfile("test.jpg", dtype=np.uint8)[None]          # [1, N] bytes of a JPEG file
+inp = g.InferInput("IMAGE", list(data.shape), "UINT8")
+inp.set_data_from_numpy(data)
+
+r = c.infer("model1_image", [inp])
+print(r.as_numpy("output0").shape)      # (1, 6, 8400)
+print(r.as_numpy("LETTERBOX"))          # e.g. [[0.5, 0, 140, 1280, 720]] for a 1280x720 image
+```
+
+Only send real image files here: a non-image breaks `preprocess` until it is reloaded.
+
+### Complete PC example
+
+Runs every JPEG/PNG in a folder through the server-side pre-processing and saves the drawn results:
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <iterator>
+#include <filesystem>
+#include <algorithm>
+#include <opencv2/imgcodecs.hpp>
+#include "TritonVision.h"
+
+namespace fs = std::filesystem;
+
+int main()
+{
+    const fs::path inputDir  = "D:\\images";
+    const fs::path outputDir = "inferenceresult";
+
+    if (!ConnectImage("140.129.7.180:8001", "model1_image")) { std::cerr << LastError() << "\n"; return 1; }
+    fs::create_directories(outputDir);
+
+    for (const auto& entry : fs::directory_iterator(inputDir)) {
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext != ".jpg" && ext != ".jpeg" && ext != ".png") continue;
+
+        // Read the file as it is: sent to the server without decoding or re-encoding on the PC
+        std::ifstream f(entry.path(), std::ios::binary);
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+        std::vector<Detection> dets = DetectImage(bytes);
+        if (dets.empty() && !LastError().empty()) {
+            std::cerr << entry.path().filename().string() << ": " << LastError() << "\n";
+            continue;
+        }
+
+        // Decode on the PC only to draw the result
+        cv::Mat img = cv::imdecode(bytes, cv::IMREAD_COLOR);
+        Draw(img, dets);
+        cv::imwrite((outputDir / entry.path().filename()).string(), img);
+
+        std::cout << entry.path().filename().string() << " -> " << dets.size()
+                  << " objects, " << LastInferMs() << " ms\n";
+    }
+    return 0;
+}
+```
+
 ### Installing on the server
 
 Requires a Triton container that includes the DALI backend (`backend: "dali"`); the one on the
 Jetson does. The pipeline is serialized from `dali.py` when the model loads, so there is no
 `model.dali` file to build.
 
-1. Copy the four folders from `server/model_repository/` into the Triton model repository
-   (on the Jetson: `~/nvidiatriton/model_repository/`), next to `model1` … `model3`.
-   Keep the empty `1/` folders: Triton needs a version folder for every model.
+1. Create `preprocess/` and `model1_image/` … `model3_image/` in the Triton model repository
+   (on the Jetson: `~/nvidiatriton/model_repository/`), next to `model1` … `model3`, with the
+   files from [Server code](#server-code). Keep the empty `1/` folders: Triton needs a version
+   folder for every model.
 2. For a different detection model, copy one `model*_image` folder and change `name`, the
    `model_name` of the second step, and the dims of `output0`. The ensembles assume the
    model has `max_batch_size: 0`, input `images` `[1, 3, 640, 640]` and output `output0`.
