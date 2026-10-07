@@ -34,6 +34,7 @@ Draw(frame, dets);                                    // boxes + labels
 - [Using the DLL in another project](#using-the-dll-in-another-project)
 - [Class names](#class-names)
 - [Supported model outputs](#supported-model-outputs)
+- [Sending images to DetectImage (JPEG/PNG)](#sending-images-to-detectimage-jpegpng)
 - [Server-side pre-processing](#server-side-pre-processing)
 - [Regenerating the gRPC code](#regenerating-the-grpc-code)
 - [Troubleshooting](#troubleshooting)
@@ -49,7 +50,7 @@ Declared in [`SDKsourceCode/include/TritonVision.h`](SDKsourceCode/include/Trito
 | `std::vector<Detection> Detect(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f)` | Runs detection on one BGR image of any size. Boxes are returned in original image pixels. |
 | `void Draw(cv::Mat& frame, const std::vector<Detection>& dets)` | Draws each box and `label score` onto the image (in place). |
 | `std::string LastError()` | Error message of the last `Connect`/`Detect`/`ConnectImage`/`DetectImage`; empty string = success. |
-| `double LastInferMs()` | Duration of the last inference request in milliseconds (network + server). For `DetectImage` this includes the server's pre-processing. |
+| `double LastInferMs()` | Duration of the last inference request in milliseconds (network + server). For `DetectImage` this includes the server's pre-processing. Work on the PC (pre-processing in `Detect`, JPEG encoding, post-processing) is not included; see [what LastInferMs measures](#what-lastinferms-measures). |
 | `bool ConnectImage(const std::string& url, const std::string& ensemble)` | Connects to Triton for [server-side pre-processing](#server-side-pre-processing). `ensemble` is the ensemble model name, e.g. `"model1_image"`. Returns `false` on failure, also when the model is not a pre-processing ensemble. |
 | `std::vector<Detection> DetectImage(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f, int jpegQuality = 90)` | Like `Detect`, but JPEG-encodes the BGR image and lets the server pre-process it. |
 | `std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f)` | Same, for bytes that are already a JPEG/PNG file (sent as is, no decoding on the PC). Other data is rejected before sending, with `LastError()` = `not a JPEG or PNG image`. |
@@ -70,8 +71,9 @@ Behaviour to know:
 - The library holds **one global connection** (one server, one model). Use it from one thread at a time.
   Calling `Connect` again replaces the connection.
   `ConnectImage` has its own separate connection, so `Detect` and `DetectImage` can be used in the same program.
-- Boxes from `Detect` and `DetectImage` on the same image differ by a few pixels at most (JPEG compression);
-  use `jpegQuality = 100` or pass PNG bytes to the `encoded` overload to avoid that.
+- Boxes from `Detect` and `DetectImage(frame)` on the same image differ by a few pixels at most (JPEG compression);
+  pass the file's bytes to `DetectImage(bytes)`, or use `jpegQuality = 100`, to avoid that
+  ([details](#sending-images-to-detectimage-jpegpng)).
 - The server address can come from anywhere (variable, config file, text box):
 
   ```cpp
@@ -292,6 +294,117 @@ one of two YOLO-style layouts:
 
 Other output formats need changes in `src/TritonVision.cpp`. `DetectImage` decodes the ensemble's
 detection output with the same code (`Postprocess` in `src/TritonVision.cpp`).
+
+## Sending images to DetectImage (JPEG/PNG)
+
+`DetectImage` sends an **encoded image file** (JPEG or PNG) to the server, not pixels. There are two ways
+to give it one:
+
+| You have | Use | What happens on the PC |
+| --- | --- | --- |
+| A `.jpg`/`.png` file, or JPEG bytes from a camera (e.g. MJPEG) | `DetectImage(bytes)` | Nothing: the bytes are sent as they are |
+| A `cv::Mat` (from `cv::imread`, `cv::VideoCapture`, a camera SDK, …) | `DetectImage(frame)` | The image is JPEG-encoded (`cv::imencode`, quality `jpegQuality`, default 90), then sent |
+| A `.bmp`, `.tif` or other format | `cv::imread` it, then `DetectImage(frame)` | As above |
+
+### Sending a file as it is (recommended for image files)
+
+The file is not decoded or re-compressed on the PC, so the server sees exactly the pixels in the file.
+This gives the same detections as `Detect` and is the fastest option.
+
+```cpp
+#include <fstream>
+#include <iterator>
+
+std::ifstream f("image.jpg", std::ios::binary);
+std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+std::vector<Detection> dets = DetectImage(bytes);
+if (dets.empty() && !LastError().empty())
+    std::cerr << LastError() << "\n";
+
+// To draw the result, decode the same bytes on the PC (only for drawing):
+cv::Mat img = cv::imdecode(bytes, cv::IMREAD_COLOR);
+Draw(img, dets);
+```
+
+### Sending a cv::Mat
+
+```cpp
+cv::Mat frame;                      // BGR, CV_8UC3, any size - same input as Detect()
+cap >> frame;
+std::vector<Detection> dets = DetectImage(frame);          // JPEG quality 90
+std::vector<Detection> best = DetectImage(frame, 0.25f, 0.45f, 100);   // JPEG quality 100
+```
+
+JPEG is lossy: the pixels the server decodes are slightly different from `frame`, so scores can move a
+little. Detections whose score is close to `conf` can appear or disappear compared to `Detect`.
+The quality setting trades request size against that difference:
+
+| `jpegQuality` | Request size | Difference to `Detect` |
+| --- | --- | --- |
+| 100 | largest JPEG (still far smaller than the ~4.9 MB float tensor of `Detect`) | smallest |
+| 90 (default) | e.g. ~1 MB for a 4K frame | boxes within a few pixels; borderline detections may change |
+| lower | smaller | larger |
+
+Measured on 41 particle images (1280×720 JPEG files, ~90–115 KB each, `model1`, `conf = 0.25`):
+
+| Call | Detections found of the 38 from `Detect` | Box difference |
+| --- | --- | --- |
+| `DetectImage(fileBytes)` | 38 / 38 | ≤ 1 px |
+| `DetectImage(frame)`, quality 90 | 36 / 38 | ≤ 1 px |
+
+The 2 missing detections were borderline: score 0.257 and 0.260 with `Detect`, 0.243 after re-encoding.
+Re-encoding an image that was already a JPEG compresses it twice; send the file bytes instead when you have them.
+
+### What is accepted
+
+`DetectImage(bytes)` checks the first bytes of the data before sending anything:
+
+| Starts with | Format | Result |
+| --- | --- | --- |
+| `FF D8 FF` | JPEG | sent |
+| `89 50 4E 47` (`.PNG`) | PNG | sent |
+| anything else (BMP, TIFF, raw pixels, text, empty) | | not sent; `LastError()` = `not a JPEG or PNG image` (or `empty image`) |
+
+The check exists because the server's DALI model cannot skip data it fails to decode: one request that is
+not an image breaks it for every client until it is reloaded
+([details](#things-to-know-about-dali-on-the-jetson)). Only the start of the data is checked; a truncated
+JPEG was tested on the server and did not break it. Clients that call Triton directly, without this library,
+do not have this check.
+
+`DetectImage(frame)` always sends a valid JPEG it made itself, so the check never rejects it.
+
+Not tested so far (if in doubt, load the image with `cv::imread` and use `DetectImage(frame)`):
+
+- JPEGs with an EXIF orientation tag (e.g. photos from a phone held upright). `cv::imread` rotates them by
+  default before `Detect`; whether the server rotates them the same way has not been checked.
+- CMYK JPEGs, 16-bit PNGs and PNGs with transparency.
+- Grayscale input (`CV_8UC1`) to `DetectImage(frame)`.
+
+### What LastInferMs measures
+
+`LastInferMs()` times only the request to the server: sending, the server's work, and the answer coming back.
+Work done on the PC before or after the request is not included.
+
+```
+Detect:       PC pre-processing ─▶ [ send tensor ─▶ model ─▶ answer ] ─▶ PC post-processing
+DetectImage:  (PC JPEG encode) ─▶ [ send JPEG ─▶ DALI pre-processing ─▶ model ─▶ answer ] ─▶ PC post-processing
+                                  └──────────── LastInferMs() ────────────┘
+```
+
+So for `DetectImage` the pre-processing **is** included (it runs on the server), for `Detect` it is not
+(it runs on the PC before the request). Post-processing (NMS, mapping boxes back) always runs on the PC and is
+never included. To time a whole call, measure it yourself:
+
+```cpp
+auto t0 = std::chrono::steady_clock::now();
+auto dets = DetectImage(bytes);
+double totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+```
+
+The first request after the Jetson has been idle is slower (~50–60 ms instead of ~23–30 ms) while the GPU
+clocks ramp up. Send one warm-up request after `ConnectImage`, or run `sudo jetson_clocks` on the Jetson to
+keep the clocks at maximum (until the next reboot; uses more power).
 
 ## Server-side pre-processing
 
