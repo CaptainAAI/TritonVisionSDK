@@ -22,3 +22,4 @@ Release/
 *.exe
 *.log
 *.tlog
+/server/model_repository
