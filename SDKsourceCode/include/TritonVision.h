@@ -5,7 +5,7 @@
 //
 // Typical use:
 //
-//     if (!Connect("192.168.1.156:8001", "model1"))      // once
+//     if (!Connect("140.129.7.180:8001", "model1"))      // once
 //         std::cerr << LastError();
 //
 //     std::vector<Detection> dets = Detect(frame);        // per image
@@ -42,7 +42,7 @@ struct Detection {
 };
 
 // Connects to the Triton server and reads the model's input/output metadata.
-//   url   - "IP:port" of the server's gRPC endpoint, e.g. "192.168.1.156:8001"
+//   url   - "IP:port" of the server's gRPC endpoint, e.g. "140.129.7.180:8001"
 //           (8001 is Triton's default gRPC port; the HTTP port 8000 does not work)
 //   model - model name exactly as it appears in the Triton model repository
 // Returns true when the server answered and the model is ready.
@@ -74,7 +74,7 @@ TV_API double LastInferMs();
 
 // ===== Server-side pre-processing (send the image only) =====
 //
-//     if (!ConnectImage("192.168.1.156:8001", "model1_image"))   // once
+//     if (!ConnectImage("140.129.7.180:8001", "model1_image"))   // once
 //         std::cerr << LastError();
 //     std::vector<Detection> dets = DetectImage(frame);           // per image
 //
@@ -99,5 +99,7 @@ TV_API bool ConnectImage(const std::string& url, const std::string& ensemble);
 TV_API std::vector<Detection> DetectImage(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f, int jpegQuality = 90);
 
 // Same, for an image that is already encoded (bytes of a .jpg/.png file):
-// sent as is, with no decoding or re-encoding on this side.
+// sent as is, with no decoding or re-encoding on this side. Only JPEG and PNG
+// are accepted; anything else fails with "not a JPEG or PNG image" without
+// being sent (a non-image request would break the server's pre-processing).
 TV_API std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f);

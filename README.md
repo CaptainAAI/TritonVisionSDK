@@ -9,13 +9,13 @@ Two ways to detect, usable side by side:
 
 - `Connect` + `Detect`: the image is pre-processed **on the PC** and sent as a float tensor (~4.9 MB at 640×640).
 - `ConnectImage` + `DetectImage`: only the **encoded image** (JPEG/PNG, typically 50–300 KB) is sent;
-  pre-processing runs **on the server** (e.g. the Jetson). Needs the server models in
+  pre-processing runs **on the server's GPU** with NVIDIA DALI (e.g. on the Jetson). Needs the server models in
   [`server/`](#server-side-pre-processing).
 
 ```cpp
 #include "TritonVision.h"
 
-if (!Connect("192.168.1.156:8001", "model1"))        // once
+if (!Connect("140.129.7.180:8001", "model1"))        // once
     std::cerr << LastError() << "\n";
 
 std::vector<Detection> dets = Detect(frame);          // per image (cv::Mat, BGR)
@@ -52,7 +52,7 @@ Declared in [`SDKsourceCode/include/TritonVision.h`](SDKsourceCode/include/Trito
 | `double LastInferMs()` | Duration of the last inference request in milliseconds (network + server). For `DetectImage` this includes the server's pre-processing. |
 | `bool ConnectImage(const std::string& url, const std::string& ensemble)` | Connects to Triton for [server-side pre-processing](#server-side-pre-processing). `ensemble` is the ensemble model name, e.g. `"model1_image"`. Returns `false` on failure, also when the model is not a pre-processing ensemble. |
 | `std::vector<Detection> DetectImage(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f, int jpegQuality = 90)` | Like `Detect`, but JPEG-encodes the BGR image and lets the server pre-process it. |
-| `std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f)` | Same, for bytes that are already a JPEG/PNG file (sent as is, no decoding on the PC). |
+| `std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f)` | Same, for bytes that are already a JPEG/PNG file (sent as is, no decoding on the PC). Other data is rejected before sending, with `LastError()` = `not a JPEG or PNG image`. |
 
 ```cpp
 struct Detection {
@@ -75,7 +75,7 @@ Behaviour to know:
 - The server address can come from anywhere (variable, config file, text box):
 
   ```cpp
-  std::string ip = "192.168.1.156";
+  std::string ip = "140.129.7.180";
   int port = 8001;
   Connect(ip + ":" + std::to_string(port), "model1");
   ```
@@ -94,8 +94,8 @@ SDKsourceCode/
 ├─ generated/                     C++ code generated from proto/ by protoc + grpc_cpp_plugin
 └─ proto/                         Triton service definitions (.proto)
 server/model_repository/          Triton models for DetectImage (copy to the server)
-├─ preprocess/                    Python backend: decode + letterbox + RGB + /255 + CHW
-└─ model1_image/                  ensemble: preprocess -> model1
+├─ preprocess/                    DALI (GPU): decode + letterbox + RGB + /255 + CHW
+└─ model1_image/ … model3_image/  ensembles: preprocess -> model1 … model3
 ```
 
 Build output goes to `bin/x64/<Debug|Release>/` and intermediate files to `obj/`. Both are ignored by git.
@@ -240,7 +240,7 @@ Do not define `TRITONVISION_EXPORTS` in the calling project; it switches the hea
 
 int main()
 {
-    if (!Connect("192.168.1.156:8001", "model1")) {
+    if (!Connect("140.129.7.180:8001", "model1")) {
         std::cerr << "connect failed: " << LastError() << "\n";
         return 1;
     }
@@ -296,19 +296,46 @@ detection output with the same code (`Postprocess` in `src/TritonVision.cpp`).
 ## Server-side pre-processing
 
 With `DetectImage` the PC sends only the encoded image. A Triton **ensemble** on the server
-decodes and pre-processes it and passes the tensor to the detection model:
+decodes and pre-processes it on the GPU with [NVIDIA DALI](https://github.com/NVIDIA/DALI)
+and passes the tensor to the detection model:
 
 ```
-PC                                   Triton server (e.g. Jetson)
+PC                                   Triton server (Jetson)
 DetectImage(frame)                   model1_image (ensemble)
-  JPEG encode ── IMAGE (UINT8) ───▶    preprocess (Python): decode, letterbox, RGB, /255, CHW
-                                       model1 (YOLO)
+  JPEG encode ── IMAGE (UINT8) ───▶    preprocess (DALI, GPU): decode, letterbox, RGB, /255, CHW
+                                       model1 (YOLO, TensorRT)
   Postprocess ◀── output0 + LETTERBOX ─┘
   (NMS, boxes back to the image)
 ```
 
-The pre-processing in [`preprocess/1/model.py`](server/model_repository/preprocess/1/model.py)
-is the same as in `Detect`, so both functions give the same detections.
+The server files are in [`server/model_repository/`](server/model_repository):
+
+| Model | Files | What it does |
+| --- | --- | --- |
+| `preprocess` | `config.pbtxt`, [`1/dali.py`](server/model_repository/preprocess/1/dali.py) | DALI pipeline: GPU decode, resize keeping the aspect ratio, centre on a 640×640 grey (114) canvas, RGB, 0..1, CHW. Outputs `images` `[3, 640, 640]` and `LETTERBOX`. Batches up to 8 requests. |
+| `model1_image`, `model2_image`, `model3_image` | `config.pbtxt`, empty `1/` | Ensembles `preprocess` → `model1` / `model2` / `model3` |
+
+The letterbox is the same as in `Detect`, so both functions give the same detections.
+Measured on the Jetson with frames from `testing.mp4`:
+
+| | `Detect` | `DetectImage` |
+| --- | --- | --- |
+| Data sent per 4K frame | ~4.9 MB (float tensor) | ~1 MB (JPEG, quality 90) |
+| Server time per request | ~27 ms (model only) | ~35 ms at 1080p, ~44 ms at 4K (DALI + model) |
+| Detections | reference | same objects, boxes within 1–3 px |
+
+Sending less data matters most when the server is on Wi-Fi; DALI adds ~8 ms (1080p) to ~17 ms (4K) on the server.
+
+Measured from a Windows PC on 41 particle images (1280×720 JPEG, `model1`), whole call incl. post-processing:
+
+| Network | `Detect(img)` | `DetectImage(fileBytes)` | `DetectImage(img)` |
+| --- | --- | --- | --- |
+| Wired, `140.129.7.180` | ~70 ms | ~31 ms | ~34 ms |
+| Wi-Fi, `192.168.1.156` | ~500–675 ms | ~108–145 ms | ~130–150 ms |
+
+`DetectImage(fileBytes)` found all 38 detections of `Detect`, boxes within 1 px. `DetectImage(img)` re-encodes
+an image that was already a JPEG and lost 2 borderline detections (score 0.257 → 0.243 with `conf = 0.25`);
+send the file bytes, or use `jpegQuality = 100`, when that matters.
 
 ### Ensemble contract
 
@@ -316,26 +343,28 @@ is the same as in `Detect`, so both functions give the same detections.
 
 | Tensor | Type / shape | Content |
 | --- | --- | --- |
-| input (any name, e.g. `IMAGE`) | `UINT8` `[-1]` (or `[1, -1]` with `max_batch_size > 0`) | bytes of a JPEG/PNG file |
-| detection output (any name, e.g. `output0`) | `FP32`, a [supported layout](#supported-model-outputs) | the YOLO model's output, in letterboxed coordinates |
-| `LETTERBOX` | `FP32` `[5]` | `scale, pad_x, pad_y, width, height` of the letterbox the server applied |
+| input (any name, here `IMAGE`) | `UINT8` `[1, -1]` (or `[-1]`) | bytes of a JPEG/PNG file |
+| detection output (any name, here `output0`) | `FP32`, a [supported layout](#supported-model-outputs) | the YOLO model's output, in letterboxed coordinates |
+| `LETTERBOX` | `FP32` `[1, 5]` (or `[5]`) | `scale, pad_x, pad_y, width, height` of the letterbox the server applied |
 
 ### Installing on the server
 
-1. Copy both folders from `server/model_repository/` into the Triton model repository, next to `model1`.
-   Keep the empty `model1_image/1/` folder: Triton needs a version folder for every model.
-2. Make `model1_image/config.pbtxt` match `model1/config.pbtxt`:
-   - `input_map` key = `model1`'s input name (default `images`)
-   - `output_map` key = `model1`'s output name (default `output0`), also in the ensemble's `output` list
-   - `max_batch_size: 0` in the ensemble expects `model1` to use `max_batch_size: 0` with dims `[1, 3, 640, 640]`
-3. If the model input is not 640×640, change `dims` of `PREPROCESSED` and the `width`/`height`
-   parameters in `preprocess/config.pbtxt`.
-4. The Python backend needs `numpy` and `opencv-python` (`cv2`) in the Python that Triton uses
-   (inside the container when Triton runs in Docker):
+Requires a Triton container that includes the DALI backend (`backend: "dali"`); the one on the
+Jetson does. The pipeline is serialized from `dali.py` when the model loads, so there is no
+`model.dali` file to build.
+
+1. Copy the four folders from `server/model_repository/` into the Triton model repository
+   (on the Jetson: `~/nvidiatriton/model_repository/`), next to `model1` … `model3`.
+   Keep the empty `1/` folders: Triton needs a version folder for every model.
+2. For a different detection model, copy one `model*_image` folder and change `name`, the
+   `model_name` of the second step, and the dims of `output0`. The ensembles assume the
+   model has `max_batch_size: 0`, input `images` `[1, 3, 640, 640]` and output `output0`.
+3. For a model input other than 640×640, change `W, H` in `dali.py` and the `images` dims
+   in `preprocess/config.pbtxt`.
+4. Restart Triton and check that all models are `READY`:
    ```bash
-   python3 -c "import cv2, numpy; print(cv2.__version__, numpy.__version__)"
+   sudo docker restart triton
    ```
-5. Restart Triton (or reload the models) and check that `preprocess` and `model1_image` are `READY`:
    ```bash
    curl -s -X POST localhost:8000/v2/repository/index
    ```
@@ -343,15 +372,28 @@ is the same as in `Detect`, so both functions give the same detections.
 Then on the PC:
 
 ```cpp
-if (!ConnectImage("192.168.1.156:8001", "model1_image"))     // once
+if (!ConnectImage("140.129.7.180:8001", "model1_image"))     // once
     std::cerr << LastError() << "\n";
 
 std::vector<Detection> dets = DetectImage(frame);             // per image (cv::Mat, BGR)
 // or: DetectImage(bytesOfJpgFile);
 ```
 
-`preprocess` runs on the CPU (`instance_group` `KIND_CPU`, 2 instances); raise `count` in
-`preprocess/config.pbtxt` when several clients send images at the same time.
+### Things to know about DALI on the Jetson
+
+- **`affine=False` is required.** By default the DALI GPU decoder asks NVML which CPU cores
+  to pin its threads to. NVML cannot answer that for the Jetson's built-in GPU, and every
+  decode fails with `nvml error (6)`. `dali.py` sets `affine=False` on the decoder.
+- **A bad image breaks the model until it is reloaded.** DALI cannot skip a sample it fails
+  to decode, so after one request that is not an image every later request fails too.
+  `DetectImage` therefore rejects anything that is not a JPEG or PNG before sending it.
+  Other clients sending to the server do not have that check. To recover, restart the
+  container, or move `preprocess/` out of the repository and back.
+- **Harmless log lines at load time:** `Could not create nvtiff decoder` (no GPU TIFF decoding
+  on Jetson; only TIFF images are affected) and `AttributeError: 'NoneType' object has no
+  attribute 'loader'` (followed by `DALI pipeline ... loaded successfully`).
+- **`__pycache__`:** the container runs as root and creates a root-owned `preprocess/1/__pycache__/`.
+  It is harmless; deleting it needs `sudo`.
 
 ## Regenerating the gRPC code
 
@@ -377,8 +419,10 @@ From the `SDKsourceCode` project folder, with `GRPC` set to the gRPC install fol
 | `Connect` fails: `failed to connect to all addresses` / `UNAVAILABLE` | Wrong IP, HTTP port 8000 instead of gRPC 8001, server down, firewall | Check the address and that the server is reachable |
 | `Connect` fails with a model error | Model name wrong or model not READY | Use the exact name from the Triton model repository |
 | `ConnectImage` fails: `... is not a pre-processing ensemble` | Name of the plain model (e.g. `model1`) given instead of the ensemble | Use the ensemble name (`model1_image`) |
-| `ConnectImage` fails with a model error / ensemble not READY | Ensemble names or dims don't match `model1`, or `cv2` missing on the server | See the Triton log; [install steps](#installing-on-the-server) 2–4 |
-| `DetectImage` fails: `cannot decode IMAGE: not a JPEG/PNG file` | The bytes are not a JPEG/PNG image | Pass a valid image file's bytes, or use the `cv::Mat` overload |
+| `ConnectImage` fails with a model error / ensemble not READY | Ensemble names or dims don't match the detection model, or `preprocess` failed to load | See the Triton log; [install steps](#installing-on-the-server) 2–3 |
+| Every `DetectImage` fails, although it worked before | A non-image request (e.g. from another client) broke the DALI `preprocess` model | Restart the container, or move `preprocess/` out of the repository and back ([details](#things-to-know-about-dali-on-the-jetson)) |
+| `DetectImage` fails with `nvml error (6)` | `affine=False` missing on the DALI decoder | Keep `affine=False` in `dali.py` ([details](#things-to-know-about-dali-on-the-jetson)) |
+| `DetectImage` fails: `not a JPEG or PNG image` | The bytes are not a JPEG/PNG image | Pass a valid image file's bytes, or use the `cv::Mat` overload |
 | C++/CLI (WinForms) app crashes at start-up with `0xC0000374` | Not caused by this DLL; happens when gRPC is compiled **into** a C++/CLI exe whose entry point is `main` | Use this DLL instead, or set Linker → Advanced → Entry Point to `mainCRTStartup` |
 
 ## Third-party code

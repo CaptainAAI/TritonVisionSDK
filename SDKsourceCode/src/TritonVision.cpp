@@ -33,6 +33,16 @@ static std::string g_img_model, g_img_in, g_img_out;    // ensemble name, input/
 static bool g_img_batched = false;                       // input shape [1, -1] (max_batch_size > 0) instead of [-1]
 static const char* const kLetterbox = "LETTERBOX";       // ensemble output: scale, pad_x, pad_y, width, height
 
+// True when the bytes start like a JPEG or PNG file. The server's DALI
+// "preprocess" model cannot skip an image it fails to decode: one request that
+// is not an image breaks it for every later request until it is reloaded.
+static bool IsJpegOrPng(const std::vector<uint8_t>& b)
+{
+    static const uint8_t jpg[] = { 0xFF, 0xD8, 0xFF }, png[] = { 0x89, 'P', 'N', 'G' };
+    return (b.size() >= 3 && std::equal(jpg, jpg + 3, b.begin())) ||
+           (b.size() >= 4 && std::equal(png, png + 4, b.begin()));
+}
+
 // Turns the raw model output (letterboxed model coordinates) into detections in
 // the original image (cols x rows). scale/px/py describe the letterbox that was applied.
 static std::vector<Detection> Postprocess(const float* d, const std::vector<int64_t>& shape,
@@ -191,6 +201,7 @@ std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float co
     g_error.clear();
     if (!g_img_client) { g_error = "not connected: call ConnectImage() first"; return {}; }
     if (encoded.empty()) { g_error = "empty image"; return {}; }
+    if (!IsJpegOrPng(encoded)) { g_error = "not a JPEG or PNG image"; return {}; }
 
     // ----- 1. Inference request: the encoded bytes, pre-processed on the server -----
     std::vector<int64_t> in_shape = { (int64_t)encoded.size() };
