@@ -64,9 +64,40 @@ TV_API std::vector<Detection> Detect(const cv::Mat& frame, float conf = 0.25f, f
 // The image is modified in place; draw on a clone to keep the original.
 TV_API void Draw(cv::Mat& frame, const std::vector<Detection>& dets);
 
-// Error message of the last Connect() or Detect() call; empty when it succeeded.
+// Error message of the last Connect(), Detect(), ConnectImage() or DetectImage()
+// call; empty when it succeeded.
 TV_API std::string LastError();
 
 // Duration of the last inference request (network round trip + server time),
 // in milliseconds. Pre- and post-processing are not included.
 TV_API double LastInferMs();
+
+// ===== Server-side pre-processing (send the image only) =====
+//
+//     if (!ConnectImage("192.168.1.156:8001", "model1_image"))   // once
+//         std::cerr << LastError();
+//     std::vector<Detection> dets = DetectImage(frame);           // per image
+//
+// The image is sent as JPEG/PNG bytes; decoding, letterbox, colour conversion
+// and scaling run on the server (Triton ensemble "preprocess" -> YOLO model).
+// Post-processing (confidence filter, NMS, box mapping) still runs here.
+// Independent of Connect()/Detect(): both can be used side by side.
+
+// Connects to the Triton server and reads the ensemble's metadata.
+//   url      - "IP:port" of the server's gRPC endpoint, as in Connect()
+//   ensemble - ensemble model name, e.g. "model1_image". It must take one
+//              UINT8 input (the encoded image) and return the detection
+//              tensor plus "LETTERBOX" = [scale, pad_x, pad_y, width, height].
+// Returns true when the server answered and the ensemble is ready.
+// On failure returns false; LastError() holds the reason.
+TV_API bool ConnectImage(const std::string& url, const std::string& ensemble);
+
+// Runs object detection on one image, pre-processed on the server.
+//   frame       - BGR image (CV_8UC3) of any size; it is JPEG-encoded before sending
+//   jpegQuality - JPEG quality 0 - 100 (higher = bigger request, closer to the original)
+// Results and errors as in Detect(). LastInferMs() includes server pre-processing.
+TV_API std::vector<Detection> DetectImage(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f, int jpegQuality = 90);
+
+// Same, for an image that is already encoded (bytes of a .jpg/.png file):
+// sent as is, with no decoding or re-encoding on this side.
+TV_API std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f);

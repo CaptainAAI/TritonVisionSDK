@@ -2,8 +2,15 @@
 
 A small C++ library (Windows DLL) for object detection through an
 [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server) over gRPC.
-An application calls 5 functions; gRPC, Protobuf and the Triton client are built into
+An application calls a handful of functions; gRPC, Protobuf and the Triton client are built into
 `TritonVision.dll`, so the application never compiles or links them.
+
+Two ways to detect, usable side by side:
+
+- `Connect` + `Detect`: the image is pre-processed **on the PC** and sent as a float tensor (~4.9 MB at 640×640).
+- `ConnectImage` + `DetectImage`: only the **encoded image** (JPEG/PNG, typically 50–300 KB) is sent;
+  pre-processing runs **on the server** (e.g. the Jetson). Needs the server models in
+  [`server/`](#server-side-pre-processing).
 
 ```cpp
 #include "TritonVision.h"
@@ -27,6 +34,7 @@ Draw(frame, dets);                                    // boxes + labels
 - [Using the DLL in another project](#using-the-dll-in-another-project)
 - [Class names](#class-names)
 - [Supported model outputs](#supported-model-outputs)
+- [Server-side pre-processing](#server-side-pre-processing)
 - [Regenerating the gRPC code](#regenerating-the-grpc-code)
 - [Troubleshooting](#troubleshooting)
 - [Third-party code](#third-party-code)
@@ -40,8 +48,11 @@ Declared in [`SDKsourceCode/include/TritonVision.h`](SDKsourceCode/include/Trito
 | `bool Connect(const std::string& url, const std::string& model)` | Connects to Triton and reads the model's input/output metadata. `url` is `"IP:port"` of the **gRPC** endpoint (default port 8001). Returns `false` on failure. |
 | `std::vector<Detection> Detect(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f)` | Runs detection on one BGR image of any size. Boxes are returned in original image pixels. |
 | `void Draw(cv::Mat& frame, const std::vector<Detection>& dets)` | Draws each box and `label score` onto the image (in place). |
-| `std::string LastError()` | Error message of the last `Connect`/`Detect`; empty string = success. |
-| `double LastInferMs()` | Duration of the last inference request in milliseconds (network + server). |
+| `std::string LastError()` | Error message of the last `Connect`/`Detect`/`ConnectImage`/`DetectImage`; empty string = success. |
+| `double LastInferMs()` | Duration of the last inference request in milliseconds (network + server). For `DetectImage` this includes the server's pre-processing. |
+| `bool ConnectImage(const std::string& url, const std::string& ensemble)` | Connects to Triton for [server-side pre-processing](#server-side-pre-processing). `ensemble` is the ensemble model name, e.g. `"model1_image"`. Returns `false` on failure, also when the model is not a pre-processing ensemble. |
+| `std::vector<Detection> DetectImage(const cv::Mat& frame, float conf = 0.25f, float nms = 0.45f, int jpegQuality = 90)` | Like `Detect`, but JPEG-encodes the BGR image and lets the server pre-process it. |
+| `std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf = 0.25f, float nms = 0.45f)` | Same, for bytes that are already a JPEG/PNG file (sent as is, no decoding on the PC). |
 
 ```cpp
 struct Detection {
@@ -58,6 +69,9 @@ Behaviour to know:
 - `Detect` blocks until the server answers. In a GUI, call it from a worker thread to keep the UI responsive.
 - The library holds **one global connection** (one server, one model). Use it from one thread at a time.
   Calling `Connect` again replaces the connection.
+  `ConnectImage` has its own separate connection, so `Detect` and `DetectImage` can be used in the same program.
+- Boxes from `Detect` and `DetectImage` on the same image differ by a few pixels at most (JPEG compression);
+  use `jpegQuality = 100` or pass PNG bytes to the `encoded` overload to avoid that.
 - The server address can come from anywhere (variable, config file, text box):
 
   ```cpp
@@ -79,6 +93,9 @@ SDKsourceCode/
 ├─ triton/                        Triton gRPC client (from NVIDIA)
 ├─ generated/                     C++ code generated from proto/ by protoc + grpc_cpp_plugin
 └─ proto/                         Triton service definitions (.proto)
+server/model_repository/          Triton models for DetectImage (copy to the server)
+├─ preprocess/                    Python backend: decode + letterbox + RGB + /255 + CHW
+└─ model1_image/                  ensemble: preprocess -> model1
 ```
 
 Build output goes to `bin/x64/<Debug|Release>/` and intermediate files to `obj/`. Both are ignored by git.
@@ -273,7 +290,68 @@ one of two YOLO-style layouts:
 | `[1, N, 6]` | per row: `x1, y1, x2, y2, score, class` | already done by the model |
 | `[1, 4 + nc, N]` | per candidate: `cx, cy, w, h`, then one score per class (column-wise) | done in `Detect` (`cv::dnn::NMSBoxes`, per class) |
 
-Other output formats need changes in `src/TritonVision.cpp`.
+Other output formats need changes in `src/TritonVision.cpp`. `DetectImage` decodes the ensemble's
+detection output with the same code (`Postprocess` in `src/TritonVision.cpp`).
+
+## Server-side pre-processing
+
+With `DetectImage` the PC sends only the encoded image. A Triton **ensemble** on the server
+decodes and pre-processes it and passes the tensor to the detection model:
+
+```
+PC                                   Triton server (e.g. Jetson)
+DetectImage(frame)                   model1_image (ensemble)
+  JPEG encode ── IMAGE (UINT8) ───▶    preprocess (Python): decode, letterbox, RGB, /255, CHW
+                                       model1 (YOLO)
+  Postprocess ◀── output0 + LETTERBOX ─┘
+  (NMS, boxes back to the image)
+```
+
+The pre-processing in [`preprocess/1/model.py`](server/model_repository/preprocess/1/model.py)
+is the same as in `Detect`, so both functions give the same detections.
+
+### Ensemble contract
+
+`ConnectImage` checks this and reads the tensor names from the server, so only `LETTERBOX` is a fixed name:
+
+| Tensor | Type / shape | Content |
+| --- | --- | --- |
+| input (any name, e.g. `IMAGE`) | `UINT8` `[-1]` (or `[1, -1]` with `max_batch_size > 0`) | bytes of a JPEG/PNG file |
+| detection output (any name, e.g. `output0`) | `FP32`, a [supported layout](#supported-model-outputs) | the YOLO model's output, in letterboxed coordinates |
+| `LETTERBOX` | `FP32` `[5]` | `scale, pad_x, pad_y, width, height` of the letterbox the server applied |
+
+### Installing on the server
+
+1. Copy both folders from `server/model_repository/` into the Triton model repository, next to `model1`.
+   Keep the empty `model1_image/1/` folder: Triton needs a version folder for every model.
+2. Make `model1_image/config.pbtxt` match `model1/config.pbtxt`:
+   - `input_map` key = `model1`'s input name (default `images`)
+   - `output_map` key = `model1`'s output name (default `output0`), also in the ensemble's `output` list
+   - `max_batch_size: 0` in the ensemble expects `model1` to use `max_batch_size: 0` with dims `[1, 3, 640, 640]`
+3. If the model input is not 640×640, change `dims` of `PREPROCESSED` and the `width`/`height`
+   parameters in `preprocess/config.pbtxt`.
+4. The Python backend needs `numpy` and `opencv-python` (`cv2`) in the Python that Triton uses
+   (inside the container when Triton runs in Docker):
+   ```bash
+   python3 -c "import cv2, numpy; print(cv2.__version__, numpy.__version__)"
+   ```
+5. Restart Triton (or reload the models) and check that `preprocess` and `model1_image` are `READY`:
+   ```bash
+   curl -s -X POST localhost:8000/v2/repository/index
+   ```
+
+Then on the PC:
+
+```cpp
+if (!ConnectImage("192.168.1.156:8001", "model1_image"))     // once
+    std::cerr << LastError() << "\n";
+
+std::vector<Detection> dets = DetectImage(frame);             // per image (cv::Mat, BGR)
+// or: DetectImage(bytesOfJpgFile);
+```
+
+`preprocess` runs on the CPU (`instance_group` `KIND_CPU`, 2 instances); raise `count` in
+`preprocess/config.pbtxt` when several clients send images at the same time.
 
 ## Regenerating the gRPC code
 
@@ -298,6 +376,9 @@ From the `SDKsourceCode` project folder, with `GRPC` set to the gRPC install fol
 | Crash or garbled strings in `Detect` / `LastError` in the calling app | The app uses the debug runtime | Same runtime as the DLL: `/MD`, no `_DEBUG` |
 | `Connect` fails: `failed to connect to all addresses` / `UNAVAILABLE` | Wrong IP, HTTP port 8000 instead of gRPC 8001, server down, firewall | Check the address and that the server is reachable |
 | `Connect` fails with a model error | Model name wrong or model not READY | Use the exact name from the Triton model repository |
+| `ConnectImage` fails: `... is not a pre-processing ensemble` | Name of the plain model (e.g. `model1`) given instead of the ensemble | Use the ensemble name (`model1_image`) |
+| `ConnectImage` fails with a model error / ensemble not READY | Ensemble names or dims don't match `model1`, or `cv2` missing on the server | See the Triton log; [install steps](#installing-on-the-server) 2–4 |
+| `DetectImage` fails: `cannot decode IMAGE: not a JPEG/PNG file` | The bytes are not a JPEG/PNG image | Pass a valid image file's bytes, or use the `cv::Mat` overload |
 | C++/CLI (WinForms) app crashes at start-up with `0xC0000374` | Not caused by this DLL; happens when gRPC is compiled **into** a C++/CLI exe whose entry point is `main` | Use this DLL instead, or set Linker → Advanced → Entry Point to `mainCRTStartup` |
 
 ## Third-party code

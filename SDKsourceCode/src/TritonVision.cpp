@@ -10,6 +10,7 @@
 #include <memory>
 #include <algorithm>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/dnn.hpp>
 #include "grpc_client.h"
 
@@ -25,6 +26,68 @@ static double g_infer_ms = 0;                                     // duration of
 // Left empty on purpose: labels are then the class id as text ("0", "1", ...),
 // and the calling application maps class_id to its own names.
 static const std::vector<std::string> kClassNames = {};
+
+// ===== State of ConnectImage() / DetectImage() (separate from Connect()) =====
+static std::unique_ptr<tc::InferenceServerGrpcClient> g_img_client;
+static std::string g_img_model, g_img_in, g_img_out;    // ensemble name, input/detection tensor names
+static bool g_img_batched = false;                       // input shape [1, -1] (max_batch_size > 0) instead of [-1]
+static const char* const kLetterbox = "LETTERBOX";       // ensemble output: scale, pad_x, pad_y, width, height
+
+// Turns the raw model output (letterboxed model coordinates) into detections in
+// the original image (cols x rows). scale/px/py describe the letterbox that was applied.
+static std::vector<Detection> Postprocess(const float* d, const std::vector<int64_t>& shape,
+    float scale, int px, int py, int cols, int rows, float conf, float nms)
+{
+    // Maps a box from model (letterboxed) coordinates back to the original frame.
+    auto toFrame = [&](float x1, float y1, float x2, float y2) {
+        x1 = std::clamp((x1 - px) / scale, 0.f, (float)cols - 1);
+        y1 = std::clamp((y1 - py) / scale, 0.f, (float)rows - 1);
+        x2 = std::clamp((x2 - px) / scale, 0.f, (float)cols - 1);
+        y2 = std::clamp((y2 - py) / scale, 0.f, (float)rows - 1);
+        return cv::Rect(cv::Point((int)x1, (int)y1), cv::Point((int)x2, (int)y2));
+        };
+    // Class name for an id, or the id as text when there is no name for it.
+    auto label = [](int id) { return id >= 0 && id < (int)kClassNames.size() ? kClassNames[id] : std::to_string(id); };
+
+    std::vector<Detection> dets;
+
+    // Output format A, end-to-end models: [1, N, 6] = x1, y1, x2, y2, score, class.
+    // NMS is already done by the model.
+    if (shape.size() == 3 && shape[2] == 6) {
+        for (int i = 0; i < (int)shape[1]; ++i) {
+            const float* r = d + i * 6;
+            if (r[4] < conf) continue;
+            dets.push_back({ toFrame(r[0], r[1], r[2], r[3]), r[4], (int)r[5], label((int)r[5]) });
+        }
+        return dets;
+    }
+
+    // Output format B, one-to-many models: [1, 4 + nc, N] = cx, cy, w, h, then one
+    // score per class, stored column-wise (value k of candidate i is d[k * n + i]).
+    const int nc = (int)shape[1] - 4, n = (int)shape[2];
+    std::vector<cv::Rect> boxes, nms_boxes;
+    std::vector<float> scores;
+    std::vector<int> ids;
+    for (int i = 0; i < n; ++i) {
+        int best = 0; float s = 0.f;                                 // best class for this candidate
+        for (int c = 0; c < nc; ++c)
+            if (d[(4 + c) * n + i] > s) { s = d[(4 + c) * n + i]; best = c; }
+        if (s < conf) continue;
+
+        float cx = d[i], cy = d[n + i], w = d[2 * n + i], h = d[3 * n + i];
+        cv::Rect b = toFrame(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
+        boxes.push_back(b);
+        // Shift each class far apart so NMS only suppresses boxes of the same class.
+        nms_boxes.push_back(b + cv::Point(best * 7680, 0));
+        scores.push_back(s);
+        ids.push_back(best);
+    }
+
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(nms_boxes, scores, conf, nms, keep);
+    for (int k : keep) dets.push_back({ boxes[k], scores[k], ids[k], label(ids[k]) });
+    return dets;
+}
 
 bool Connect(const std::string& url, const std::string& model)
 {
@@ -96,55 +159,86 @@ std::vector<Detection> Detect(const cv::Mat& frame, float conf, float nms)
     const float* d = reinterpret_cast<const float*>(buf);
 
     // ----- 3. Post-process -----
-    // Maps a box from model (letterboxed) coordinates back to the original frame.
-    auto toFrame = [&](float x1, float y1, float x2, float y2) {
-        x1 = std::clamp((x1 - px) / scale, 0.f, (float)frame.cols - 1);
-        y1 = std::clamp((y1 - py) / scale, 0.f, (float)frame.rows - 1);
-        x2 = std::clamp((x2 - px) / scale, 0.f, (float)frame.cols - 1);
-        y2 = std::clamp((y2 - py) / scale, 0.f, (float)frame.rows - 1);
-        return cv::Rect(cv::Point((int)x1, (int)y1), cv::Point((int)x2, (int)y2));
-        };
-    // Class name for an id, or the id as text when there is no name for it.
-    auto label = [](int id) { return id >= 0 && id < (int)kClassNames.size() ? kClassNames[id] : std::to_string(id); };
+    return Postprocess(d, shape, scale, px, py, frame.cols, frame.rows, conf, nms);
+}
 
-    std::vector<Detection> dets;
+bool ConnectImage(const std::string& url, const std::string& ensemble)
+{
+    tc::Error err = tc::InferenceServerGrpcClient::Create(&g_img_client, url, false);
+    if (!err.IsOk()) { g_error = err.Message(); return false; }
 
-    // Output format A, end-to-end models: [1, N, 6] = x1, y1, x2, y2, score, class.
-    // NMS is already done by the model.
-    if (shape.size() == 3 && shape[2] == 6) {
-        for (int i = 0; i < (int)shape[1]; ++i) {
-            const float* r = d + i * 6;
-            if (r[4] < conf) continue;
-            dets.push_back({ toFrame(r[0], r[1], r[2], r[3]), r[4], (int)r[5], label((int)r[5]) });
-        }
-        return dets;
+    inference::ModelMetadataResponse md;
+    err = g_img_client->ModelMetadata(&md, ensemble);
+    if (!err.IsOk()) { g_error = err.Message(); g_img_client.reset(); return false; }
+
+    // Expect one input (encoded image) and two outputs: detections + LETTERBOX.
+    g_img_out.clear();
+    for (const auto& o : md.outputs())
+        if (o.name() != kLetterbox) g_img_out = o.name();
+    if (md.inputs_size() != 1 || md.outputs_size() != 2 || g_img_out.empty()) {
+        g_error = ensemble + " is not a pre-processing ensemble (needs 1 input and outputs <detections> + LETTERBOX)";
+        g_img_client.reset(); return false;
     }
 
-    // Output format B, one-to-many models: [1, 4 + nc, N] = cx, cy, w, h, then one
-    // score per class, stored column-wise (value k of candidate i is d[k * n + i]).
-    const int nc = (int)shape[1] - 4, n = (int)shape[2];
-    std::vector<cv::Rect> boxes, nms_boxes;
-    std::vector<float> scores;
-    std::vector<int> ids;
-    for (int i = 0; i < n; ++i) {
-        int best = 0; float s = 0.f;                                 // best class for this candidate
-        for (int c = 0; c < nc; ++c)
-            if (d[(4 + c) * n + i] > s) { s = d[(4 + c) * n + i]; best = c; }
-        if (s < conf) continue;
+    g_img_model = ensemble;
+    g_img_in = md.inputs(0).name();
+    g_img_batched = md.inputs(0).shape_size() == 2;
+    return true;
+}
 
-        float cx = d[i], cy = d[n + i], w = d[2 * n + i], h = d[3 * n + i];
-        cv::Rect b = toFrame(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
-        boxes.push_back(b);
-        // Shift each class far apart so NMS only suppresses boxes of the same class.
-        nms_boxes.push_back(b + cv::Point(best * 7680, 0));
-        scores.push_back(s);
-        ids.push_back(best);
+std::vector<Detection> DetectImage(const std::vector<uint8_t>& encoded, float conf, float nms)
+{
+    g_error.clear();
+    if (!g_img_client) { g_error = "not connected: call ConnectImage() first"; return {}; }
+    if (encoded.empty()) { g_error = "empty image"; return {}; }
+
+    // ----- 1. Inference request: the encoded bytes, pre-processed on the server -----
+    std::vector<int64_t> in_shape = { (int64_t)encoded.size() };
+    if (g_img_batched) in_shape.insert(in_shape.begin(), 1);
+
+    tc::InferInput* in_raw;
+    tc::InferInput::Create(&in_raw, g_img_in, in_shape, "UINT8");
+    std::unique_ptr<tc::InferInput> input(in_raw);
+    input->AppendRaw(encoded.data(), encoded.size());
+
+    tc::InferRequestedOutput *out_raw, *lb_raw;
+    tc::InferRequestedOutput::Create(&out_raw, g_img_out);
+    tc::InferRequestedOutput::Create(&lb_raw, kLetterbox);
+    std::unique_ptr<tc::InferRequestedOutput> output(out_raw), letterbox(lb_raw);
+
+    auto t0 = std::chrono::steady_clock::now();
+    tc::InferResult* res_raw;
+    tc::Error err = g_img_client->Infer(&res_raw, tc::InferOptions(g_img_model), { input.get() }, { output.get(), letterbox.get() });
+    g_infer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!err.IsOk()) { g_error = err.Message(); return {}; }
+
+    std::unique_ptr<tc::InferResult> res(res_raw);
+    if (!res->RequestStatus().IsOk()) { g_error = res->RequestStatus().Message(); return {}; }
+
+    std::vector<int64_t> shape;
+    const uint8_t* buf; size_t size;
+    res->Shape(g_img_out, &shape);
+    res->RawData(g_img_out, &buf, &size);
+    const float* d = reinterpret_cast<const float*>(buf);
+
+    // How the server letterboxed the image, needed to map boxes back.
+    const uint8_t* lb_buf; size_t lb_size;
+    res->RawData(kLetterbox, &lb_buf, &lb_size);
+    if (lb_size < 5 * sizeof(float)) { g_error = "invalid LETTERBOX output"; return {}; }
+    const float* lb = reinterpret_cast<const float*>(lb_buf);    // scale, pad_x, pad_y, width, height
+
+    // ----- 2. Post-process -----
+    return Postprocess(d, shape, lb[0], (int)lb[1], (int)lb[2], (int)lb[3], (int)lb[4], conf, nms);
+}
+
+std::vector<Detection> DetectImage(const cv::Mat& frame, float conf, float nms, int jpegQuality)
+{
+    if (frame.empty()) { g_error = "empty frame"; return {}; }
+    std::vector<uint8_t> jpg;
+    if (!cv::imencode(".jpg", frame, jpg, { cv::IMWRITE_JPEG_QUALITY, jpegQuality })) {
+        g_error = "JPEG encoding failed"; return {};
     }
-
-    std::vector<int> keep;
-    cv::dnn::NMSBoxes(nms_boxes, scores, conf, nms, keep);
-    for (int k : keep) dets.push_back({ boxes[k], scores[k], ids[k], label(ids[k]) });
-    return dets;
+    return DetectImage(jpg, conf, nms);
 }
 
 void Draw(cv::Mat& frame, const std::vector<Detection>& dets)
